@@ -65,21 +65,46 @@ def run_command(cmd: List[str]) -> str:
 
 
 def get_container_port_from_inspect(c_id: str) -> str:
-    """Consulta 'container inspect' para extraer o porto exposto ou configurado."""
+    """Consulta 'container inspect' para extraer o porto exposto ou configurado.
+
+    O porto aparece nos argumentos do proceso de inicio (--port N, --port=N ou
+    --server.port=N) ou, en ausencia destes, nos patróns xerais de exposición.
+    """
     try:
         res = subprocess.run(
             ["container", "inspect", c_id],
             capture_output=True, text=True
         )
         if res.returncode == 0 and res.stdout.strip():
-            # Buscamos patron de portos tipo 8501, 8765, etc.
+            # 1. Parseo fiable do JSON para ler os argumentos do proceso
+            data = json.loads(res.stdout)
+            container = data[0] if isinstance(data, list) and data else {}
+            init = container.get("configuration", {}).get("initProcess", {})
+
+            # 1a. Argumentos coa forma --port=8765 ou --server.port=8501
+            args = init.get("arguments", []) or []
+            for arg in args:
+                match = re.match(r"^--(?:server\.)?port=(\d{1,5})$", arg)
+                if match:
+                    return match.group(1)
+
+            # 1b. Argumentos coa forma --port 8765 (o valor vén no seguinte elemento)
+            for i, arg in enumerate(args):
+                if arg in ("--port", "-p", "--server.port") and i + 1 < len(args):
+                    nxt = args[i + 1]
+                    if nxt.isdigit():
+                        return nxt
+
+            # 1c. Variable de contorna PORT=8765
+            for env in init.get("environment", []) or []:
+                match = re.match(r"^PORT=(\d{1,5})$", env)
+                if match:
+                    return match.group(1)
+
+            # 2. Fallback sobre o texto bruto: patróns tipo 8501/tcp
             matches = re.findall(r'"(\d{4,5})/tcp"', res.stdout)
             if matches:
                 return matches[0]
-            # Proba secundaria: buscar calquera número de porto de 4 díxitos
-            matches_digits = re.findall(r'"Port":\s*"?(\d{4,5})"?', res.stdout, re.IGNORECASE)
-            if matches_digits:
-                return matches_digits[0]
     except Exception as e:
         logger.debug(f"Erro no inspect de {c_id}: {e}")
     return ""
@@ -109,13 +134,6 @@ def get_containers() -> List[Dict[str, Any]]:
                 is_running = state == "running"
 
                 port = get_container_port_from_inspect(c_id) if is_running else ""
-                
-                # Fallback por nome/imaxe se non se atopou o porto
-                if is_running and not port:
-                    if "actas" in c_id or "streamlit" in image:
-                        port = "8501"
-                    elif "gestdoc" in c_id:
-                        port = "8765"
 
                 external_url = f"http://{host_ip}:{port}" if (is_running and port) else None
 
