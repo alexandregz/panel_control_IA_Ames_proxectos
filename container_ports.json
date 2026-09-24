@@ -1,0 +1,17 @@
+{
+  "reserved_ports": {
+    "ia-actas-plenos-ames": {
+      "container_port": 8501,
+      "host_port": 8501
+    },
+    "gestdoc_downloader": {
+      "container_port": 8765,
+      "host_port": 8765
+    },
+    "ia-xgl-ames": {
+      "container_port": 8765,
+      "host_port": 8766
+    }
+  },
+  "note": "Cada proxecto reserva un host_port único. Ese porto é o que publica o contedor no host (-p host:guest); o panel usa configuration.publishedPorts como fonte de verdade e marca un conflito se dous contedores en execución publican o mesmo host_port."
+}
