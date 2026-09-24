@@ -64,28 +64,6 @@ def run_command(cmd: List[str]) -> str:
         raise HTTPException(status_code=500, detail=f"Erro inesperado: {str(e)}")
 
 
-# --- Manifest de portos reservados (garantía de unicidade por proxecto) ---
-
-_PORT_REGISTRY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "container_ports.json")
-
-
-def load_port_registry() -> Dict[str, Dict[str, Any]]:
-    """Carga o manifesento de portos reservados por proxecto (container_ports.json).
-
-    Cada proxecto reserva un host_port único para evitar colisións entre contedores
-    en execución simultánea. Se o ficheiro falla ou está ausente, devolve {} (o panel
-    funciona sen esa capa de garantía).
-    """
-    try:
-        with open(_PORT_REGISTRY_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        reserved = data.get("reserved_ports", {}) if isinstance(data, dict) else {}
-        return reserved if isinstance(reserved, dict) else {}
-    except Exception as e:
-        logger.error(f"Non se puido cargar o manifesento de portos ({_PORT_REGISTRY_PATH}): {e}")
-        return {}
-
-
 def get_container_network_info(c_id: str) -> Dict[str, str]:
     """Extrae a info de rede dun contedor desde 'container inspect'.
 
@@ -156,7 +134,6 @@ def get_containers() -> List[Dict[str, Any]]:
             return []
 
         host_ip = get_external_ip()
-        registry = load_port_registry()
         containers = []
 
         for line in lines[1:]:
@@ -179,9 +156,6 @@ def get_containers() -> List[Dict[str, Any]]:
                 external_url = f"http://{host_ip}:{host_port}" if (is_running and host_port) else None
                 guest_url = f"http://{guest_ip}:{container_port}" if (is_running and guest_ip and container_port) else None
 
-                reserved = registry.get(c_id, {}) or {}
-                reserved_host = str(reserved.get("host_port") or "")
-
                 containers.append({
                     "id": c_id,
                     "name": c_id,
@@ -196,7 +170,6 @@ def get_containers() -> List[Dict[str, Any]]:
                     "guest_ip": guest_ip,
                     "port_conflict": False,
                     "conflicting_with": [],
-                    "registry_violation": bool(is_running and reserved_host and host_port != reserved_host),
                 })
 
         # Detección de colisións de porto host entre contedores en execución
@@ -354,15 +327,7 @@ def dashboard():
                                         <span x-text="c.id"></span> e <span class="font-mono" x-text="c.conflicting_with.join(', ')"></span>
                                         publican ambos o porto <span class="font-mono" x-text="c.host_port"></span> no host.
                                     </p>
-                                    <p class="text-[11px] text-rose-300/80 mt-1">Reasigna un porto host único a un deles (manifest: container_ports.json).</p>
-                                </div>
-                            </template>
-
-                            <!-- Aviso de desón co manifest de portos reservados -->
-                            <template x-if="c.running && c.registry_violation">
-                                <div class="mt-3 p-2 bg-amber-950/50 rounded-lg border border-amber-500/40">
-                                    <p class="text-[10px] text-amber-300 uppercase tracking-wider font-semibold">⚠️ Porto distinto ao reservado</p>
-                                    <p class="text-[11px] text-amber-200/90">Publicado <span class="font-mono" x-text="c.host_port"></span>; o manifest reserva outro porto host para este proxecto.</p>
+                                    <p class="text-[11px] text-rose-300/80 mt-1">Reasigna un porto host único a un deles ao recrear o contedor.</p>
                                 </div>
                             </template>
 
