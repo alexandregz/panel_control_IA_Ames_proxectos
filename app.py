@@ -64,50 +64,87 @@ def run_command(cmd: List[str]) -> str:
         raise HTTPException(status_code=500, detail=f"Erro inesperado: {str(e)}")
 
 
-def get_container_port_from_inspect(c_id: str) -> str:
-    """Consulta 'container inspect' para extraer o porto exposto ou configurado.
+# --- Manifest de portos reservados (garantía de unicidade por proxecto) ---
 
-    O porto aparece nos argumentos do proceso de inicio (--port N, --port=N ou
-    --server.port=N) ou, en ausencia destes, nos patróns xerais de exposición.
+_PORT_REGISTRY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "container_ports.json")
+
+
+def load_port_registry() -> Dict[str, Dict[str, Any]]:
+    """Carga o manifesento de portos reservados por proxecto (container_ports.json).
+
+    Cada proxecto reserva un host_port único para evitar colisións entre contedores
+    en execución simultánea. Se o ficheiro falla ou está ausente, devolve {} (o panel
+    funciona sen esa capa de garantía).
     """
+    try:
+        with open(_PORT_REGISTRY_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        reserved = data.get("reserved_ports", {}) if isinstance(data, dict) else {}
+        return reserved if isinstance(reserved, dict) else {}
+    except Exception as e:
+        logger.error(f"Non se puido cargar o manifesento de portos ({_PORT_REGISTRY_PATH}): {e}")
+        return {}
+
+
+def get_container_network_info(c_id: str) -> Dict[str, str]:
+    """Extrae a info de rede dun contedor desde 'container inspect'.
+
+    Fonte de verdade do porto: configuration.publishedPorts (hostPort). Ademais le
+    a IP do guest (status.networks[].ipv4Address), que é única por contedor e serve
+    como fallback de acceso directo cando hai unha colisión de porto host.
+    """
+    info = {"host_port": "", "container_port": "", "guest_ip": ""}
     try:
         res = subprocess.run(
             ["container", "inspect", c_id],
             capture_output=True, text=True
         )
-        if res.returncode == 0 and res.stdout.strip():
-            # 1. Parseo fiable do JSON para ler os argumentos do proceso
-            data = json.loads(res.stdout)
-            container = data[0] if isinstance(data, list) and data else {}
-            init = container.get("configuration", {}).get("initProcess", {})
+        if res.returncode != 0 or not res.stdout.strip():
+            return info
 
-            # 1a. Argumentos coa forma --port=8765 ou --server.port=8501
-            args = init.get("arguments", []) or []
-            for arg in args:
-                match = re.match(r"^--(?:server\.)?port=(\d{1,5})$", arg)
-                if match:
-                    return match.group(1)
+        data = json.loads(res.stdout)
+        container = data[0] if isinstance(data, list) and data else {}
+        cfg = container.get("configuration", {})
+        init = cfg.get("initProcess", {})
 
-            # 1b. Argumentos coa forma --port 8765 (o valor vén no seguinte elemento)
+        # IP do guest (única por contedor, rede bridge100)
+        networks = container.get("status", {}).get("networks", []) or []
+        if networks:
+            ip = networks[0].get("ipv4Address", "") or ""
+            if ip:
+                info["guest_ip"] = ip.split("/")[0]
+
+        # Porto publicado no host: fonte de verdade
+        published = cfg.get("publishedPorts", []) or []
+        if published:
+            info["host_port"] = str(published[0].get("hostPort") or "")
+            info["container_port"] = str(published[0].get("containerPort") or "")
+            return info
+
+        # Fallback: dedución do porto desde os argumentos do proceso (contedores sen -p)
+        args = init.get("arguments", []) or []
+        port = ""
+        for arg in args:
+            match = re.match(r"^--(?:server\.)?port=(\d{1,5})$", arg)
+            if match:
+                port = match.group(1)
+                break
+        if not port:
             for i, arg in enumerate(args):
-                if arg in ("--port", "-p", "--server.port") and i + 1 < len(args):
-                    nxt = args[i + 1]
-                    if nxt.isdigit():
-                        return nxt
-
-            # 1c. Variable de contorna PORT=8765
+                if arg in ("--port", "-p", "--server.port") and i + 1 < len(args) and args[i + 1].isdigit():
+                    port = args[i + 1]
+                    break
+        if not port:
             for env in init.get("environment", []) or []:
                 match = re.match(r"^PORT=(\d{1,5})$", env)
                 if match:
-                    return match.group(1)
-
-            # 2. Fallback sobre o texto bruto: patróns tipo 8501/tcp
-            matches = re.findall(r'"(\d{4,5})/tcp"', res.stdout)
-            if matches:
-                return matches[0]
+                    port = match.group(1)
+                    break
+        info["container_port"] = port
+        info["host_port"] = port
     except Exception as e:
         logger.debug(f"Erro no inspect de {c_id}: {e}")
-    return ""
+    return info
 
 def get_containers() -> List[Dict[str, Any]]:
     """Obtén a lista de contedores. Se o servizo do sistema está caído, devolve [] sen lanzar erro 500."""
@@ -119,6 +156,7 @@ def get_containers() -> List[Dict[str, Any]]:
             return []
 
         host_ip = get_external_ip()
+        registry = load_port_registry()
         containers = []
 
         for line in lines[1:]:
@@ -133,9 +171,16 @@ def get_containers() -> List[Dict[str, Any]]:
                 state = "running" if "running" in line.lower() else "stopped"
                 is_running = state == "running"
 
-                port = get_container_port_from_inspect(c_id) if is_running else ""
+                net = get_container_network_info(c_id)
+                host_port = net["host_port"]
+                container_port = net["container_port"]
+                guest_ip = net["guest_ip"]
 
-                external_url = f"http://{host_ip}:{port}" if (is_running and port) else None
+                external_url = f"http://{host_ip}:{host_port}" if (is_running and host_port) else None
+                guest_url = f"http://{guest_ip}:{container_port}" if (is_running and guest_ip and container_port) else None
+
+                reserved = registry.get(c_id, {}) or {}
+                reserved_host = str(reserved.get("host_port") or "")
 
                 containers.append({
                     "id": c_id,
@@ -144,8 +189,26 @@ def get_containers() -> List[Dict[str, Any]]:
                     "state": state,
                     "running": is_running,
                     "url": external_url,
-                    "port": port
+                    "guest_url": guest_url,
+                    "port": host_port,
+                    "container_port": container_port,
+                    "host_port": host_port,
+                    "guest_ip": guest_ip,
+                    "port_conflict": False,
+                    "conflicting_with": [],
+                    "registry_violation": bool(is_running and reserved_host and host_port != reserved_host),
                 })
+
+        # Detección de colisións de porto host entre contedores en execución
+        running_ports = [c["host_port"] for c in containers if c["running"] and c["host_port"]]
+        used = {p for p in running_ports if running_ports.count(p) > 1}
+        running = [c for c in containers if c["running"]]
+        for c in containers:
+            if c["running"] and c["host_port"] in used:
+                c["port_conflict"] = True
+                c["conflicting_with"] = [o["id"] for o in running
+                                          if o["id"] != c["id"] and o["host_port"] == c["host_port"]]
+
         return containers
     except Exception as e:
         logger.error(f"O servizo do sistema parece estar caído ou sen resposta: {e}")
@@ -283,13 +346,44 @@ def dashboard():
                                 </span>
                             </div>
 
-                            <!-- Link de acceso IP externa (só se mostra se c.url existe) -->
-                            <template x-if="c.running && c.url">
+                            <!-- Aviso de conflito de porto host (dous contedores publican o mesmo) -->
+                            <template x-if="c.running && c.port_conflict">
+                                <div class="mt-3 p-2 bg-rose-950/50 rounded-lg border border-rose-500/40">
+                                    <p class="text-[10px] text-rose-300 uppercase tracking-wider font-semibold mb-1">⚠️ Conflito de porto host</p>
+                                    <p class="text-xs text-rose-200">
+                                        <span x-text="c.id"></span> e <span class="font-mono" x-text="c.conflicting_with.join(', ')"></span>
+                                        publican ambos o porto <span class="font-mono" x-text="c.host_port"></span> no host.
+                                    </p>
+                                    <p class="text-[11px] text-rose-300/80 mt-1">Reasigna un porto host único a un deles (manifest: container_ports.json).</p>
+                                </div>
+                            </template>
+
+                            <!-- Aviso de desón co manifest de portos reservados -->
+                            <template x-if="c.running && c.registry_violation">
+                                <div class="mt-3 p-2 bg-amber-950/50 rounded-lg border border-amber-500/40">
+                                    <p class="text-[10px] text-amber-300 uppercase tracking-wider font-semibold">⚠️ Porto distinto ao reservado</p>
+                                    <p class="text-[11px] text-amber-200/90">Publicado <span class="font-mono" x-text="c.host_port"></span>; o manifest reserva outro porto host para este proxecto.</p>
+                                </div>
+                            </template>
+
+                            <!-- Link de acceso IP externa (só se mostra se c.url existe e non hai conflito) -->
+                            <template x-if="c.running && c.url && !c.port_conflict">
                                 <div class="mt-3 p-2 bg-slate-900/60 rounded-lg border border-slate-700/30">
                                     <p class="text-[10px] text-slate-400 uppercase tracking-wider font-semibold mb-0.5">Acceso Externo</p>
                                     <a :href="c.url" target="_blank" rel="noopener noreferrer" class="text-xs font-mono text-indigo-400 hover:text-indigo-300 hover:underline flex items-center gap-1 truncate">
                                         <i class="fa-solid fa-arrow-up-right-from-square text-[10px]"></i>
                                         <span x-text="c.url"></span>
+                                    </a>
+                                </div>
+                            </template>
+
+                            <!-- Acceso directo por IP do guest (fallback cando hai conflito ou falta URL externa) -->
+                            <template x-if="c.running && c.guest_url">
+                                <div class="mt-3 p-2 bg-slate-900/40 rounded-lg border border-slate-700/30">
+                                    <p class="text-[10px] text-slate-500 uppercase tracking-wider font-semibold mb-0.5">Acceso directo (rede interna do Mac)</p>
+                                    <a :href="c.guest_url" target="_blank" rel="noopener noreferrer" class="text-xs font-mono text-cyan-400 hover:text-cyan-300 hover:underline flex items-center gap-1 truncate">
+                                        <i class="fa-solid fa-arrow-up-right-from-square text-[10px]"></i>
+                                        <span x-text="c.guest_url"></span>
                                     </a>
                                 </div>
                             </template>
@@ -308,9 +402,10 @@ def dashboard():
 
                             <template x-if="c.running">
                                 <div class="flex w-full gap-2">
-                                    <template x-if="c.url">
-                                        <a :href="c.url" target="_blank" rel="noopener noreferrer"
-                                           class="flex-1 bg-emerald-600 hover:bg-emerald-500 text-white font-medium py-2 px-3 rounded-xl text-xs transition flex items-center justify-center gap-1.5">
+                                    <template x-if="c.url || c.guest_url">
+                                        <a :href="c.port_conflict ? c.guest_url : c.url" target="_blank" rel="noopener noreferrer"
+                                           class="flex-1 bg-emerald-600 hover:bg-emerald-500 text-white font-medium py-2 px-3 rounded-xl text-xs transition flex items-center justify-center gap-1.5"
+                                           :title="c.port_conflict ? 'Acceso directo por IP do guest (porto host en conflito)' : ''">
                                             <i class="fa-solid fa-external-link text-xs"></i>
                                             <span>Abrir App</span>
                                         </a>
