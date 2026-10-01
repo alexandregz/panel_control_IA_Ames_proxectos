@@ -155,6 +155,8 @@ def get_containers() -> List[Dict[str, Any]]:
 
                 external_url = f"http://{host_ip}:{host_port}" if (is_running and host_port) else None
                 guest_url = f"http://{guest_ip}:{container_port}" if (is_running and guest_ip and container_port) else None
+                # Enderezo compacto ip:porto (sempe que haxa porto host asignado)
+                address = f"{host_ip}:{host_port}" if host_port else None
 
                 containers.append({
                     "id": c_id,
@@ -164,6 +166,7 @@ def get_containers() -> List[Dict[str, Any]]:
                     "running": is_running,
                     "url": external_url,
                     "guest_url": guest_url,
+                    "address": address,
                     "port": host_port,
                     "container_port": container_port,
                     "host_port": host_port,
@@ -309,6 +312,9 @@ def dashboard():
                                 <div>
                                     <h2 class="font-bold text-slate-100 truncate max-w-[180px]" x-text="c.name" :title="c.name"></h2>
                                     <p class="text-xs text-slate-400 font-mono mt-0.5 truncate max-w-[180px]" x-text="c.image" :title="c.image"></p>
+                                    <!-- Enderezo ip:porto do contedor (debaixo da imaxe) -->
+                                    <p class="text-[11px] text-emerald-300 font-mono mt-1 truncate max-w-[180px]"
+                                       x-show="c.address" x-text="c.address" :title="c.address"></p>
                                 </div>
                                 <span class="px-2.5 py-1 text-xs font-semibold rounded-full border flex items-center gap-1.5"
                                       :class="c.running 
